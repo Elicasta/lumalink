@@ -1,22 +1,29 @@
+use crate::settings::{
+    load_config, remove_virtual_bus as remove_saved_virtual_bus, upsert_virtual_bus,
+    VirtualBusRecord,
+};
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput};
 use serde::Serialize;
 use std::sync::{Arc, Mutex};
 use tauri::{AppHandle, Emitter, State};
 use uuid::Uuid;
 
-#[cfg(unix)]
+#[cfg(target_os = "macos")]
 use midir::{
     os::unix::{VirtualInput, VirtualOutput},
     MidiOutputConnection,
 };
 
+#[cfg(target_os = "windows")]
+use std::process::Command;
+
 #[derive(Default)]
 pub(crate) struct MidiRuntime {
     monitor: Option<MidiInputConnection<()>>,
     routes: Vec<(String, MidiInputConnection<()>)>,
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     virtual_inputs: Vec<(String, MidiInputConnection<()>)>,
-    #[cfg(unix)]
+    #[cfg(target_os = "macos")]
     virtual_outputs: Vec<(String, MidiOutputConnection)>,
 }
 
@@ -39,6 +46,14 @@ pub(crate) struct MidiEvent {
     timestamp: u64,
     source: String,
     bytes: Vec<u8>,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct VirtualMidiBackendStatus {
+    platform: String,
+    available: bool,
+    message: String,
 }
 
 #[tauri::command]
@@ -215,9 +230,7 @@ pub(crate) fn start_midi_route(
         .routes
         .push((route_id.clone(), connection));
 
-    Ok(format!(
-        "{route_id}:{source_name} -> {destination_name}"
-    ))
+    Ok(format!("{route_id}:{source_name} -> {destination_name}"))
 }
 
 #[tauri::command]
@@ -277,24 +290,30 @@ pub(crate) fn midi_panic() -> Result<(), String> {
     }
 }
 
-#[cfg(unix)]
 #[tauri::command]
-pub(crate) fn create_virtual_midi_bus(
-    app: AppHandle,
-    runtime: State<Mutex<MidiRuntime>>,
-    name: String,
-) -> Result<String, String> {
-    let trimmed = name.trim();
+pub(crate) fn list_virtual_midi_buses(app: AppHandle) -> Result<Vec<VirtualBusRecord>, String> {
+    Ok(load_config(&app)?.virtual_buses)
+}
 
-    if trimmed.is_empty() {
-        return Err("Virtual bus name cannot be empty".into());
+#[cfg(target_os = "macos")]
+fn create_platform_virtual_bus(
+    app: &AppHandle,
+    runtime: &Mutex<MidiRuntime>,
+    name: &str,
+) -> Result<Option<String>, String> {
+    let mut guard = runtime
+        .lock()
+        .map_err(|_| "MIDI runtime lock poisoned".to_string())?;
+
+    if guard.virtual_inputs.iter().any(|(existing, _)| existing == name) {
+        return Ok(None);
     }
 
     let mut input =
         MidiInput::new("LumaLink virtual input").map_err(|error| error.to_string())?;
     input.ignore(Ignore::None);
 
-    let input_name = format!("{trimmed} · IN");
+    let input_name = format!("{name} · IN");
     let event_source = input_name.clone();
     let app_for_event = app.clone();
 
@@ -318,38 +337,256 @@ pub(crate) fn create_virtual_midi_bus(
     let output =
         MidiOutput::new("LumaLink virtual output").map_err(|error| error.to_string())?;
 
-    let output_name = format!("{trimmed} · OUT");
-
+    let output_name = format!("{name} · OUT");
     let output_connection = output
         .create_virtual(&output_name)
         .map_err(|error| error.to_string())?;
 
+    guard
+        .virtual_inputs
+        .push((name.to_string(), input_connection));
+    guard
+        .virtual_outputs
+        .push((name.to_string(), output_connection));
+
+    Ok(None)
+}
+
+#[cfg(target_os = "macos")]
+fn remove_platform_virtual_bus(
+    runtime: &Mutex<MidiRuntime>,
+    record: &VirtualBusRecord,
+) -> Result<(), String> {
     let mut guard = runtime
         .lock()
         .map_err(|_| "MIDI runtime lock poisoned".to_string())?;
 
-    guard
-        .virtual_inputs
-        .push((trimmed.to_string(), input_connection));
+    guard.virtual_inputs.retain(|(name, _)| name != &record.name);
+    guard.virtual_outputs.retain(|(name, _)| name != &record.name);
 
-    guard
-        .virtual_outputs
-        .push((trimmed.to_string(), output_connection));
-
-    Ok(format!("Created CoreMIDI virtual bus: {trimmed}"))
+    Ok(())
 }
 
-#[cfg(not(unix))]
+#[cfg(target_os = "windows")]
+fn powershell(script: &str) -> Result<String, String> {
+    let output = Command::new("pwsh")
+        .args([
+            "-NoLogo",
+            "-NoProfile",
+            "-NonInteractive",
+            "-Command",
+            script,
+        ])
+        .output()
+        .map_err(|error| {
+            format!(
+                "Windows MIDI Services PowerShell tools require PowerShell 7 and the WindowsMidiServices module: {error}"
+            )
+        })?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        return Err(if stderr.is_empty() { stdout } else { stderr });
+    }
+
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+#[cfg(target_os = "windows")]
+fn escape_powershell_single_quoted(value: &str) -> String {
+    value.replace(''', "''")
+}
+
+#[cfg(target_os = "windows")]
+fn windows_midi_services_ready() -> Result<bool, String> {
+    let script = "$ErrorActionPreference='Stop'; Import-Module WindowsMidiServices; Start-Midi | Out-Null; if (Get-Command New-MidiBasicLoopback -ErrorAction SilentlyContinue) { 'READY' }";
+    Ok(powershell(script)?.contains("READY"))
+}
+
+#[cfg(target_os = "windows")]
+fn create_platform_virtual_bus(
+    _app: &AppHandle,
+    _runtime: &Mutex<MidiRuntime>,
+    name: &str,
+) -> Result<Option<String>, String> {
+    if !windows_midi_services_ready()? {
+        return Err("Windows MIDI Services basic loopbacks are not available on this PC.".into());
+    }
+
+    let escaped_name = escape_powershell_single_quoted(name);
+    let script = format!(
+        "$ErrorActionPreference='Stop'; Import-Module WindowsMidiServices; Start-Midi | Out-Null;          $existing = Get-MidiBasicLoopback | Where-Object {{ $_.Endpoint.Name -eq '{escaped_name}' }} | Select-Object -First 1;          if ($null -eq $existing) {{ New-MidiBasicLoopback -Name '{escaped_name}' | Out-Null;          $existing = Get-MidiBasicLoopback | Where-Object {{ $_.Endpoint.Name -eq '{escaped_name}' }} | Select-Object -First 1 }};          if ($null -eq $existing) {{ throw 'Windows MIDI Services created no matching loopback endpoint.' }};          $existing.AssociationId.ToString()"
+    );
+
+    let association_id = powershell(&script)?;
+    Ok(if association_id.is_empty() {
+        None
+    } else {
+        Some(association_id)
+    })
+}
+
+#[cfg(target_os = "windows")]
+fn remove_platform_virtual_bus(
+    _runtime: &Mutex<MidiRuntime>,
+    record: &VirtualBusRecord,
+) -> Result<(), String> {
+    let escaped_name = escape_powershell_single_quoted(&record.name);
+    let script = format!(
+        "$ErrorActionPreference='Stop'; Import-Module WindowsMidiServices; Start-Midi | Out-Null;          Get-MidiBasicLoopback | Where-Object {{ $_.Endpoint.Name -eq '{escaped_name}' }} | Remove-MidiBasicLoopback"
+    );
+
+    powershell(&script).map(|_| ())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn create_platform_virtual_bus(
+    _app: &AppHandle,
+    _runtime: &Mutex<MidiRuntime>,
+    _name: &str,
+) -> Result<Option<String>, String> {
+    Err("Virtual MIDI buses are only implemented on macOS and Windows.".into())
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "windows")))]
+fn remove_platform_virtual_bus(
+    _runtime: &Mutex<MidiRuntime>,
+    _record: &VirtualBusRecord,
+) -> Result<(), String> {
+    Ok(())
+}
+
+#[tauri::command]
+pub(crate) fn virtual_midi_backend_status() -> VirtualMidiBackendStatus {
+    #[cfg(target_os = "macos")]
+    {
+        return VirtualMidiBackendStatus {
+            platform: "macOS".into(),
+            available: true,
+            message: "CoreMIDI virtual endpoints are available.".into(),
+        };
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        return match windows_midi_services_ready() {
+            Ok(true) => VirtualMidiBackendStatus {
+                platform: "Windows".into(),
+                available: true,
+                message: "Windows MIDI Services basic loopbacks are available.".into(),
+            },
+            Ok(false) => VirtualMidiBackendStatus {
+                platform: "Windows".into(),
+                available: false,
+                message: "Windows MIDI Services basic loopbacks are not installed or enabled.".into(),
+            },
+            Err(error) => VirtualMidiBackendStatus {
+                platform: "Windows".into(),
+                available: false,
+                message: error,
+            },
+        };
+    }
+
+    #[allow(unreachable_code)]
+    VirtualMidiBackendStatus {
+        platform: std::env::consts::OS.into(),
+        available: false,
+        message: "Virtual MIDI buses are not implemented on this platform.".into(),
+    }
+}
+
 #[tauri::command]
 pub(crate) fn create_virtual_midi_bus(
-    _app: AppHandle,
-    _runtime: State<Mutex<MidiRuntime>>,
-    _name: String,
-) -> Result<String, String> {
-    Err(
-        "Windows virtual buses are not active in this build yet. Physical MIDI routing works now; native Windows MIDI Services virtual-device support is the next backend module."
-            .into(),
+    app: AppHandle,
+    runtime: State<Mutex<MidiRuntime>>,
+    name: String,
+) -> Result<VirtualBusRecord, String> {
+    let trimmed = name.trim();
+
+    if trimmed.is_empty() {
+        return Err("Virtual bus name cannot be empty".into());
+    }
+
+    let config = load_config(&app)?;
+    if config
+        .virtual_buses
+        .iter()
+        .any(|record| record.name.eq_ignore_ascii_case(trimmed))
+    {
+        return Err(format!("A virtual bus named "{trimmed}" already exists."));
+    }
+
+    let association_id = create_platform_virtual_bus(&app, &runtime, trimmed)?;
+
+    let backend = if cfg!(target_os = "macos") {
+        "coremidi"
+    } else if cfg!(target_os = "windows") {
+        "windows-midi-services-basic-loopback"
+    } else {
+        "unsupported"
+    };
+
+    upsert_virtual_bus(
+        &app,
+        VirtualBusRecord {
+            id: Uuid::new_v4().to_string(),
+            name: trimmed.to_string(),
+            backend: backend.into(),
+            association_id,
+        },
     )
+}
+
+#[tauri::command]
+pub(crate) fn remove_virtual_midi_bus(
+    app: AppHandle,
+    runtime: State<Mutex<MidiRuntime>>,
+    id: String,
+) -> Result<(), String> {
+    let config = load_config(&app)?;
+    let record = config
+        .virtual_buses
+        .iter()
+        .find(|record| record.id == id)
+        .cloned()
+        .ok_or_else(|| "Virtual bus not found".to_string())?;
+
+    remove_platform_virtual_bus(&runtime, &record)?;
+    remove_saved_virtual_bus(&app, &id)?;
+
+    Ok(())
+}
+
+pub(crate) fn restore_virtual_midi_buses(
+    app: &AppHandle,
+    runtime: &Mutex<MidiRuntime>,
+) -> Result<Vec<String>, String> {
+    let mut restored = Vec::new();
+    let mut config = load_config(app)?;
+    let mut changed = false;
+
+    for record in &mut config.virtual_buses {
+        match create_platform_virtual_bus(app, runtime, &record.name) {
+            Ok(association_id) => {
+                if association_id.is_some() && association_id != record.association_id {
+                    record.association_id = association_id;
+                    changed = true;
+                }
+                restored.push(record.name.clone());
+            }
+            Err(error) => {
+                eprintln!("LumaLink could not restore virtual bus {}: {}", record.name, error);
+            }
+        }
+    }
+
+    if changed {
+        crate::settings::save_config(app, &config)?;
+    }
+
+    Ok(restored)
 }
 
 #[cfg(test)]
@@ -359,5 +596,11 @@ mod tests {
         for channel in 0..16u8 {
             assert_eq!((0xB0 | channel) & 0x0F, channel);
         }
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn powershell_single_quote_escaping_is_safe() {
+        assert_eq!(super::escape_powershell_single_quoted("Kid's Bus"), "Kid''s Bus");
     }
 }
