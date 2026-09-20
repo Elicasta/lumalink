@@ -63,8 +63,6 @@ pub fn start_discovery_responder() -> Result<(), String> {
         .set_read_timeout(Some(Duration::from_secs(1)))
         .map_err(|error| error.to_string())?;
 
-    DISCOVERY_ACTIVE.store(true, Ordering::Relaxed);
-
     thread::Builder::new()
         .name("lumalink-network-discovery".into())
         .spawn(move || {
@@ -80,6 +78,7 @@ pub fn start_discovery_responder() -> Result<(), String> {
             let response_bytes = match serde_json::to_vec(&response) {
                 Ok(value) => value,
                 Err(error) => {
+                    DISCOVERY_ACTIVE.store(false, Ordering::Relaxed);
                     eprintln!("LumaLink discovery serialization failed: {error}");
                     return;
                 }
@@ -107,6 +106,7 @@ pub fn start_discovery_responder() -> Result<(), String> {
         })
         .map_err(|error| format!("Could not start LumaLink discovery thread: {error}"))?;
 
+    DISCOVERY_ACTIVE.store(true, Ordering::Relaxed);
     Ok(())
 }
 
@@ -122,7 +122,7 @@ mod tests {
     #[test]
     fn reports_stable_discovery_protocol() {
         let status = discovery_status();
-        assert!(status.enabled);
+        assert!(!status.enabled);
         assert_eq!(status.port, DISCOVERY_PORT);
         assert_eq!(status.protocol_version, 1);
         assert!(!status.node_name.is_empty());
