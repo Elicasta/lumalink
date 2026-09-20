@@ -32,6 +32,13 @@ type MidiSnapshot = { inputs: MidiDevice[]; outputs: MidiDevice[] };
 type MidiEvent = { timestamp: number; source: string; bytes: number[] };
 type NdiSource = { name: string; url?: string | null };
 type NdiStatus = { available: boolean; library?: string | null; error?: string | null };
+type NetworkDiscoveryStatus = {
+  enabled: boolean;
+  port: number;
+  nodeName: string;
+  platform: string;
+  protocolVersion: number;
+};
 
 type VirtualBusRecord = {
   id: string;
@@ -143,6 +150,7 @@ export default function App() {
 
   const [ndiStatus, setNdiStatus] = useState<NdiStatus>({ available: false });
   const [ndiSources, setNdiSources] = useState<NdiSource[]>([]);
+  const [networkStatus, setNetworkStatus] = useState<NetworkDiscoveryStatus | null>(null);
   const [notice, setNotice] = useState('');
 
   const activeRouteCount = savedRoutes.filter((status) => status.active).length;
@@ -176,6 +184,14 @@ export default function App() {
     }
   }
 
+  async function refreshNetwork() {
+    try {
+      setNetworkStatus(await invoke<NetworkDiscoveryStatus>('network_discovery_status'));
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }
+
   async function refreshNdi() {
     try {
       const status = await invoke<NdiStatus>('ndi_runtime_status');
@@ -195,6 +211,7 @@ export default function App() {
     void refreshRoutes();
     void refreshVirtualMidi();
     void refreshNdi();
+    void refreshNetwork();
 
     const unlisten = listen<MidiEvent>('midi-event', ({ payload }) => {
       setEvents((current) => [payload, ...current].slice(0, 500));
@@ -786,6 +803,26 @@ export default function App() {
                 <h1>Settings</h1>
               </div>
             </div>
+
+            <Panel title="LAN DISCOVERY" icon={<Network size={16}/>}>
+              <div className="runtime-line">
+                <span className={`big-dot ${networkStatus?.enabled ? 'online' : ''}`} />
+                <div>
+                  <strong>
+                    {networkStatus?.enabled ? `${networkStatus.nodeName} is discoverable` : 'LAN discovery unavailable'}
+                  </strong>
+                  <small>
+                    {networkStatus
+                      ? `${networkStatus.platform.toUpperCase()} · UDP ${networkStatus.port} · protocol v${networkStatus.protocolVersion}`
+                      : 'Checking LumaLink network discovery…'}
+                  </small>
+                </div>
+                <button onClick={refreshNetwork}><RefreshCw size={14}/> Refresh</button>
+              </div>
+              <p className="help">
+                LumaStudio can use this beacon to find this computer on the same wired or Wi-Fi network, then connect directly to local services such as ProPresenter.
+              </p>
+            </Panel>
 
             <Panel title="BUILD PROFILE" icon={<Settings size={16}/>}>
               <div className="settings-list">
