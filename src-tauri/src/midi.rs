@@ -395,7 +395,7 @@ fn powershell(script: &str) -> Result<String, String> {
 
 #[cfg(target_os = "windows")]
 fn escape_powershell_single_quoted(value: &str) -> String {
-    value.replace(''', "''")
+    value.replace('\'', "''")
 }
 
 #[cfg(target_os = "windows")]
@@ -515,7 +515,7 @@ pub(crate) fn create_virtual_midi_bus(
         .iter()
         .any(|record| record.name.eq_ignore_ascii_case(trimmed))
     {
-        return Err(format!("A virtual bus named "{trimmed}" already exists."));
+        return Err(format!("A virtual bus named \"{trimmed}\" already exists."));
     }
 
     let association_id = create_platform_virtual_bus(&app, &runtime, trimmed)?;
