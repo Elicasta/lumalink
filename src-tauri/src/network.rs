@@ -2,12 +2,14 @@ use serde::Serialize;
 use std::{
     env,
     net::UdpSocket,
+    sync::atomic::{AtomicBool, Ordering},
     thread,
     time::Duration,
 };
 
 pub const DISCOVERY_PORT: u16 = 49777;
 const DISCOVERY_REQUEST: &[u8] = b"LUMALINK_DISCOVER_V1";
+static DISCOVERY_ACTIVE: AtomicBool = AtomicBool::new(false);
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -46,7 +48,7 @@ fn platform_name() -> String {
 
 pub fn discovery_status() -> NetworkDiscoveryStatus {
     NetworkDiscoveryStatus {
-        enabled: true,
+        enabled: DISCOVERY_ACTIVE.load(Ordering::Relaxed),
         port: DISCOVERY_PORT,
         node_name: node_name(),
         platform: platform_name(),
@@ -60,6 +62,8 @@ pub fn start_discovery_responder() -> Result<(), String> {
     socket
         .set_read_timeout(Some(Duration::from_secs(1)))
         .map_err(|error| error.to_string())?;
+
+    DISCOVERY_ACTIVE.store(true, Ordering::Relaxed);
 
     thread::Builder::new()
         .name("lumalink-network-discovery".into())
@@ -85,7 +89,7 @@ pub fn start_discovery_responder() -> Result<(), String> {
             loop {
                 match socket.recv_from(&mut buffer) {
                     Ok((size, source)) => {
-                        if buffer[..size] == *DISCOVERY_REQUEST {
+                        if &buffer[..size] == DISCOVERY_REQUEST {
                             if let Err(error) = socket.send_to(&response_bytes, source) {
                                 eprintln!("LumaLink discovery response failed: {error}");
                             }
