@@ -4,13 +4,18 @@ mod settings;
 
 use midi::{
     create_virtual_midi_bus,
+    delete_midi_route,
     list_midi_devices,
+    list_saved_midi_routes,
     list_virtual_midi_buses,
     midi_panic,
+    reconnect_enabled_midi_routes,
     remove_virtual_midi_bus,
+    restore_saved_midi_routes,
     restore_virtual_midi_buses,
+    save_midi_route,
+    set_midi_route_enabled,
     start_midi_monitor,
-    start_midi_route,
     stop_all_midi_routes,
     stop_midi_monitor,
     virtual_midi_backend_status,
@@ -32,7 +37,11 @@ pub fn run() {
             list_midi_devices,
             start_midi_monitor,
             stop_midi_monitor,
-            start_midi_route,
+            list_saved_midi_routes,
+            save_midi_route,
+            set_midi_route_enabled,
+            delete_midi_route,
+            reconnect_enabled_midi_routes,
             stop_all_midi_routes,
             midi_panic,
             list_virtual_midi_buses,
@@ -86,10 +95,26 @@ pub fn run() {
                 .build(app)?;
 
             let midi_runtime = app.state::<Mutex<MidiRuntime>>();
+
             if let Err(error) =
                 restore_virtual_midi_buses(app.handle(), midi_runtime.inner())
             {
                 eprintln!("LumaLink virtual bus restore failed: {error}");
+            }
+
+            match restore_saved_midi_routes(app.handle(), midi_runtime.inner()) {
+                Ok(statuses) => {
+                    for status in statuses {
+                        if let Some(error) = status.error {
+                            eprintln!(
+                                "LumaLink route restore failed for {}: {}",
+                                status.route.name,
+                                error
+                            );
+                        }
+                    }
+                }
+                Err(error) => eprintln!("LumaLink route restore failed: {error}"),
             }
 
             Ok(())

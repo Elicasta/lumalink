@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useEffect, useState } from 'react';
 import type { ReactNode } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { listen } from '@tauri-apps/api/event';
@@ -32,16 +32,44 @@ type MidiSnapshot = { inputs: MidiDevice[]; outputs: MidiDevice[] };
 type MidiEvent = { timestamp: number; source: string; bytes: number[] };
 type NdiSource = { name: string; url?: string | null };
 type NdiStatus = { available: boolean; library?: string | null; error?: string | null };
+
 type VirtualBusRecord = {
   id: string;
   name: string;
   backend: string;
   associationId?: string | null;
 };
+
 type VirtualMidiBackendStatus = {
   platform: string;
   available: boolean;
   message: string;
+};
+
+type MidiRouteTransform = {
+  inputChannel: number | null;
+  outputChannel: number | null;
+  transpose: number;
+  velocityPercent: number;
+  ccFrom: number | null;
+  ccTo: number | null;
+  blockTiming: boolean;
+  blockSysex: boolean;
+};
+
+type MidiRouteRecord = {
+  id: string;
+  name: string;
+  inputName: string;
+  outputName: string;
+  enabled: boolean;
+  transform: MidiRouteTransform;
+};
+
+type MidiRouteRuntimeStatus = {
+  route: MidiRouteRecord;
+  active: boolean;
+  error?: string | null;
 };
 
 const tabs: { id: Tab; label: string; icon: typeof Cable }[] = [
@@ -51,6 +79,8 @@ const tabs: { id: Tab; label: string; icon: typeof Cable }[] = [
   { id: 'ndi', label: 'NDI', icon: Radio },
   { id: 'settings', label: 'SETTINGS', icon: Settings }
 ];
+
+const channels = Array.from({ length: 16 }, (_, index) => index + 1);
 
 function bytesToMessage(bytes: number[]) {
   if (!bytes.length) return 'EMPTY';
@@ -65,7 +95,23 @@ function bytesToMessage(bytes: number[]) {
   if (status === 0xfa) return 'START';
   if (status === 0xfb) return 'CONTINUE';
   if (status === 0xfc) return 'STOP';
-  return bytes.map((b) => b.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+  return bytes.map((byte) => byte.toString(16).padStart(2, '0').toUpperCase()).join(' ');
+}
+
+function routeTransformSummary(transform: MidiRouteTransform) {
+  const parts: string[] = [];
+
+  if (transform.inputChannel) parts.push(`IN CH ${transform.inputChannel}`);
+  if (transform.outputChannel) parts.push(`OUT CH ${transform.outputChannel}`);
+  if (transform.transpose) parts.push(`${transform.transpose > 0 ? '+' : ''}${transform.transpose} ST`);
+  if (transform.velocityPercent !== 100) parts.push(`VEL ${transform.velocityPercent}%`);
+  if (transform.ccFrom !== null && transform.ccTo !== null) {
+    parts.push(`CC ${transform.ccFrom}→${transform.ccTo}`);
+  }
+  if (transform.blockTiming) parts.push('NO CLOCK');
+  if (transform.blockSysex) parts.push('NO SYSEX');
+
+  return parts.length ? parts : ['PASS THROUGH'];
 }
 
 export default function App() {
@@ -73,9 +119,20 @@ export default function App() {
   const [midi, setMidi] = useState<MidiSnapshot>({ inputs: [], outputs: [] });
   const [events, setEvents] = useState<MidiEvent[]>([]);
   const [monitoring, setMonitoring] = useState<number | null>(null);
+
   const [source, setSource] = useState<number | ''>('');
   const [destination, setDestination] = useState<number | ''>('');
-  const [routeActive, setRouteActive] = useState(false);
+  const [routeName, setRouteName] = useState('');
+  const [inputChannel, setInputChannel] = useState<number | ''>('');
+  const [outputChannel, setOutputChannel] = useState<number | ''>('');
+  const [transpose, setTranspose] = useState(0);
+  const [velocityPercent, setVelocityPercent] = useState(100);
+  const [ccFrom, setCcFrom] = useState<number | ''>('');
+  const [ccTo, setCcTo] = useState<number | ''>('');
+  const [blockTiming, setBlockTiming] = useState(false);
+  const [blockSysex, setBlockSysex] = useState(false);
+  const [savedRoutes, setSavedRoutes] = useState<MidiRouteRuntimeStatus[]>([]);
+
   const [virtualName, setVirtualName] = useState('LumaLink Bus 1');
   const [virtualBuses, setVirtualBuses] = useState<VirtualBusRecord[]>([]);
   const [virtualBackend, setVirtualBackend] = useState<VirtualMidiBackendStatus>({
@@ -83,14 +140,24 @@ export default function App() {
     available: false,
     message: 'Checking virtual MIDI support…'
   });
+
   const [ndiStatus, setNdiStatus] = useState<NdiStatus>({ available: false });
   const [ndiSources, setNdiSources] = useState<NdiSource[]>([]);
   const [notice, setNotice] = useState('');
 
+  const activeRouteCount = savedRoutes.filter((status) => status.active).length;
+
   async function refreshMidi() {
     try {
-      const snapshot = await invoke<MidiSnapshot>('list_midi_devices');
-      setMidi(snapshot);
+      setMidi(await invoke<MidiSnapshot>('list_midi_devices'));
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }
+
+  async function refreshRoutes() {
+    try {
+      setSavedRoutes(await invoke<MidiRouteRuntimeStatus[]>('list_saved_midi_routes'));
     } catch (error) {
       setNotice(String(error));
     }
@@ -125,6 +192,7 @@ export default function App() {
 
   useEffect(() => {
     void refreshMidi();
+    void refreshRoutes();
     void refreshVirtualMidi();
     void refreshNdi();
 
@@ -137,15 +205,6 @@ export default function App() {
     };
   }, []);
 
-  const inputByIndex = useMemo(
-    () => new Map(midi.inputs.map((device) => [device.index, device])),
-    [midi.inputs]
-  );
-  const outputByIndex = useMemo(
-    () => new Map(midi.outputs.map((device) => [device.index, device])),
-    [midi.outputs]
-  );
-
   async function toggleMonitor(index: number) {
     try {
       if (monitoring === index) {
@@ -153,6 +212,7 @@ export default function App() {
         setMonitoring(null);
         return;
       }
+
       await invoke('start_midi_monitor', { inputIndex: index });
       setMonitoring(index);
       setTab('monitor');
@@ -175,19 +235,93 @@ export default function App() {
     try {
       await invoke('remove_virtual_midi_bus', { id });
       setNotice(`Removed virtual MIDI bus: ${name}`);
-      await Promise.all([refreshMidi(), refreshVirtualMidi()]);
+      await Promise.all([refreshMidi(), refreshVirtualMidi(), refreshRoutes()]);
     } catch (error) {
       setNotice(String(error));
     }
   }
 
-  async function startRoute() {
+  async function saveRoute() {
     if (source === '' || destination === '') return;
+
+    const input = midi.inputs.find((device) => device.index === source);
+    const output = midi.outputs.find((device) => device.index === destination);
+
+    if (!input || !output) {
+      setNotice('The selected MIDI endpoint disappeared. Refresh devices and try again.');
+      return;
+    }
+
+    const route: MidiRouteRecord = {
+      id: '',
+      name: routeName.trim() || `${input.name} → ${output.name}`,
+      inputName: input.name,
+      outputName: output.name,
+      enabled: true,
+      transform: {
+        inputChannel: inputChannel === '' ? null : inputChannel,
+        outputChannel: outputChannel === '' ? null : outputChannel,
+        transpose,
+        velocityPercent,
+        ccFrom: ccFrom === '' ? null : ccFrom,
+        ccTo: ccTo === '' ? null : ccTo,
+        blockTiming,
+        blockSysex
+      }
+    };
+
     try {
-      await invoke('start_midi_route', { inputIndex: source, outputIndex: destination });
-      setRouteActive(true);
+      const status = await invoke<MidiRouteRuntimeStatus>('save_midi_route', { route });
       setNotice(
-        `Routing ${inputByIndex.get(source)?.name ?? source} → ${outputByIndex.get(destination)?.name ?? destination}`
+        status.error
+          ? `Saved ${status.route.name}, but it is offline: ${status.error}`
+          : `Saved and started ${status.route.name}`
+      );
+      setRouteName('');
+      await refreshRoutes();
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }
+
+  async function toggleSavedRoute(status: MidiRouteRuntimeStatus) {
+    try {
+      const next = await invoke<MidiRouteRuntimeStatus>('set_midi_route_enabled', {
+        id: status.route.id,
+        enabled: !status.route.enabled
+      });
+
+      setNotice(
+        next.error
+          ? `${next.route.name} is enabled but offline: ${next.error}`
+          : `${next.route.name} ${next.route.enabled ? 'enabled' : 'disabled'}`
+      );
+      await refreshRoutes();
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }
+
+  async function deleteRoute(status: MidiRouteRuntimeStatus) {
+    try {
+      await invoke('delete_midi_route', { id: status.route.id });
+      setNotice(`Removed route: ${status.route.name}`);
+      await refreshRoutes();
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }
+
+  async function reconnectRoutes() {
+    try {
+      const statuses = await invoke<MidiRouteRuntimeStatus[]>('reconnect_enabled_midi_routes');
+      setSavedRoutes(statuses);
+
+      const failed = statuses.filter((status) => status.route.enabled && !status.active);
+      setNotice(
+        failed.length
+          ? `Reconnected routes. ${failed.length} route${failed.length === 1 ? '' : 's'} still offline.`
+          : 'All enabled MIDI routes are connected.'
       );
     } catch (error) {
       setNotice(String(error));
@@ -197,8 +331,8 @@ export default function App() {
   async function stopRoutes() {
     try {
       await invoke('stop_all_midi_routes');
-      setRouteActive(false);
-      setNotice('MIDI routes stopped');
+      setNotice('All runtime MIDI routes stopped. Saved route settings were kept.');
+      await refreshRoutes();
     } catch (error) {
       setNotice(String(error));
     }
@@ -223,6 +357,7 @@ export default function App() {
             <small>SYSTEM I/O</small>
           </div>
         </div>
+
         <div className="status-cluster">
           <span className="status-dot online" /> MIDI ENGINE
           <span className={`status-dot ${ndiStatus.available ? 'online' : ''}`} />
@@ -327,7 +462,7 @@ export default function App() {
                         <small>
                           {bus.backend === 'coremidi'
                             ? 'COREMIDI · APPS ↔ LUMALINK'
-                            : 'WINDOWS MIDI SERVICES · BASIC LOOPBACK'}
+                            : 'WINDOWS MIDI SERVICES · COMPATIBILITY LOOPBACK'}
                         </small>
                       </div>
                       <button
@@ -352,15 +487,26 @@ export default function App() {
           <>
             <div className="section-head">
               <div>
-                <p className="eyebrow">PATCH BAY</p>
+                <p className="eyebrow">PATCH BAY + TRANSLATOR</p>
                 <h1>MIDI Routing</h1>
               </div>
-              <span className={`route-state ${routeActive ? 'live' : ''}`}>
-                {routeActive ? 'ROUTING LIVE' : 'IDLE'}
+              <span className={`route-state ${activeRouteCount ? 'live' : ''}`}>
+                {activeRouteCount ? `${activeRouteCount} LIVE` : 'IDLE'}
               </span>
             </div>
 
-            <Panel title="NEW ROUTE" icon={<Route size={16}/>}>
+            <Panel title="NEW SAVED ROUTE" icon={<Route size={16}/>}>
+              <div className="route-name-row">
+                <label>
+                  ROUTE NAME
+                  <input
+                    value={routeName}
+                    onChange={(event) => setRouteName(event.target.value)}
+                    placeholder="Optional. Example: Keys → LumaStudio"
+                  />
+                </label>
+              </div>
+
               <div className="route-builder">
                 <label>
                   SOURCE
@@ -391,27 +537,161 @@ export default function App() {
                 </label>
               </div>
 
+              <div className="transform-grid">
+                <label>
+                  INPUT CHANNEL
+                  <select
+                    value={inputChannel}
+                    onChange={(event) => setInputChannel(event.target.value === '' ? '' : Number(event.target.value))}
+                  >
+                    <option value="">Any</option>
+                    {channels.map((channel) => <option key={channel} value={channel}>{channel}</option>)}
+                  </select>
+                </label>
+
+                <label>
+                  OUTPUT CHANNEL
+                  <select
+                    value={outputChannel}
+                    onChange={(event) => setOutputChannel(event.target.value === '' ? '' : Number(event.target.value))}
+                  >
+                    <option value="">Same</option>
+                    {channels.map((channel) => <option key={channel} value={channel}>{channel}</option>)}
+                  </select>
+                </label>
+
+                <label>
+                  TRANSPOSE
+                  <input
+                    type="number"
+                    min={-48}
+                    max={48}
+                    value={transpose}
+                    onChange={(event) => setTranspose(Number(event.target.value))}
+                  />
+                </label>
+
+                <label>
+                  VELOCITY %
+                  <input
+                    type="number"
+                    min={1}
+                    max={200}
+                    value={velocityPercent}
+                    onChange={(event) => setVelocityPercent(Number(event.target.value))}
+                  />
+                </label>
+
+                <label>
+                  CC FROM
+                  <input
+                    type="number"
+                    min={0}
+                    max={127}
+                    value={ccFrom}
+                    placeholder="Off"
+                    onChange={(event) => setCcFrom(event.target.value === '' ? '' : Number(event.target.value))}
+                  />
+                </label>
+
+                <label>
+                  CC TO
+                  <input
+                    type="number"
+                    min={0}
+                    max={127}
+                    value={ccTo}
+                    placeholder="Off"
+                    onChange={(event) => setCcTo(event.target.value === '' ? '' : Number(event.target.value))}
+                  />
+                </label>
+              </div>
+
+              <div className="route-options">
+                <label className="check-option">
+                  <input
+                    type="checkbox"
+                    checked={blockTiming}
+                    onChange={(event) => setBlockTiming(event.target.checked)}
+                  />
+                  Block MIDI clock / transport
+                </label>
+                <label className="check-option">
+                  <input
+                    type="checkbox"
+                    checked={blockSysex}
+                    onChange={(event) => setBlockSysex(event.target.checked)}
+                  />
+                  Block SysEx
+                </label>
+              </div>
+
               <div className="button-row">
                 <button
                   className="primary"
-                  onClick={startRoute}
+                  onClick={saveRoute}
                   disabled={source === '' || destination === ''}
                 >
-                  <Play size={15}/> Start Route
+                  <Plus size={15}/> Save + Enable
                 </button>
-                <button onClick={stopRoutes}><CircleStop size={15}/> Stop All</button>
+                <button onClick={reconnectRoutes}><RefreshCw size={15}/> Reconnect Enabled</button>
+                <button onClick={stopRoutes}><CircleStop size={15}/> Stop Runtime</button>
               </div>
             </Panel>
 
-            <Panel title="ROUTER RULES" icon={<SquareTerminal size={16}/>}>
+            <Panel title={`SAVED ROUTES · ${savedRoutes.length}`} icon={<SquareTerminal size={16}/>}>
+              {savedRoutes.length === 0 ? (
+                <Empty text="No saved routes yet." />
+              ) : (
+                <div className="saved-route-list">
+                  {savedRoutes.map((status) => (
+                    <div className="saved-route" key={status.route.id}>
+                      <div className="saved-route-main">
+                        <span className={`status-dot ${status.active ? 'online' : ''}`} />
+                        <div className="saved-route-copy">
+                          <strong>{status.route.name}</strong>
+                          <small>{status.route.inputName} → {status.route.outputName}</small>
+                          <div className="route-chips">
+                            {routeTransformSummary(status.route.transform).map((part) => (
+                              <span key={part}>{part}</span>
+                            ))}
+                          </div>
+                          {status.error && <p className="route-error">{status.error}</p>}
+                        </div>
+                      </div>
+
+                      <div className="saved-route-actions">
+                        <span className={`route-badge ${status.active ? 'live' : status.route.enabled ? 'offline' : ''}`}>
+                          {status.active ? 'LIVE' : status.route.enabled ? 'OFFLINE' : 'DISABLED'}
+                        </span>
+                        <button
+                          className="ghost"
+                          onClick={() => toggleSavedRoute(status)}
+                        >
+                          {status.route.enabled ? 'DISABLE' : 'ENABLE'}
+                        </button>
+                        <button
+                          className="danger-small"
+                          onClick={() => deleteRoute(status)}
+                        >
+                          REMOVE
+                        </button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </Panel>
+
+            <Panel title="ROUTER BEHAVIOR" icon={<SquareTerminal size={16}/>}>
               <div className="rule-grid">
-                <span>ONE → ONE</span>
-                <span>ONE → MANY</span>
-                <span>MANY → ONE</span>
-                <span>HOT-PLUG READY</span>
+                <span>NAME-BOUND PORTS</span>
+                <span>PERSISTENT ROUTES</span>
+                <span>BYTE TRANSFORMS</span>
+                <span>MANUAL RECONNECT</span>
               </div>
               <p className="help">
-                Multiple routes can run simultaneously. Mapping and translation stay above this transport layer so routing and message transforms do not get tangled together.
+                Routes are saved against endpoint names instead of volatile port numbers. Enabled routes are restored at launch, stay alive when the window closes, and can be reconnected after a USB device returns.
               </p>
             </Panel>
           </>
@@ -429,7 +709,7 @@ export default function App() {
 
             <div className="monitor-console">
               {events.length === 0 ? (
-                <Empty text="Choose MONITOR on a MIDI input and move a control." />
+                <Empty text="Choose MONITOR on a MIDI input or start a saved route." />
               ) : (
                 events.map((event, index) => (
                   <div className="monitor-row" key={`${event.timestamp}-${index}`}>
@@ -511,7 +791,11 @@ export default function App() {
               <div className="settings-list">
                 <div>
                   <strong>Background system utility</strong>
-                  <small>Closing the window hides LumaLink to the tray instead of destroying virtual MIDI endpoints. Use Quit from the tray to stop the process.</small>
+                  <small>Closing the window hides LumaLink to the tray instead of destroying virtual MIDI endpoints or active routes. Use Quit from the tray to stop the process.</small>
+                </div>
+                <div>
+                  <strong>Saved routing</strong>
+                  <small>Routes bind to endpoint names and restore when LumaLink launches. Reconnect Enabled retries missing USB endpoints without changing the saved patch.</small>
                 </div>
                 <div>
                   <strong>macOS test signing</strong>
