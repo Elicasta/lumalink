@@ -319,3 +319,6 @@ button:disabled { opacity: .35; cursor: default; }
   .monitor-row{grid-template-columns:90px 150px 1fr}
   .monitor-row small{display:none}
 }
+
+.virtual-create { margin-top: 16px; }
+.virtual-bus-list { margin-top: 12px; }

@@ -32,6 +32,17 @@ type MidiSnapshot = { inputs: MidiDevice[]; outputs: MidiDevice[] };
 type MidiEvent = { timestamp: number; source: string; bytes: number[] };
 type NdiSource = { name: string; url?: string | null };
 type NdiStatus = { available: boolean; library?: string | null; error?: string | null };
+type VirtualBusRecord = {
+  id: string;
+  name: string;
+  backend: string;
+  associationId?: string | null;
+};
+type VirtualMidiBackendStatus = {
+  platform: string;
+  available: boolean;
+  message: string;
+};
 
 const tabs: { id: Tab; label: string; icon: typeof Cable }[] = [
   { id: 'midi', label: 'MIDI', icon: Cable },
@@ -66,6 +77,12 @@ export default function App() {
   const [destination, setDestination] = useState<number | ''>('');
   const [routeActive, setRouteActive] = useState(false);
   const [virtualName, setVirtualName] = useState('LumaLink Bus 1');
+  const [virtualBuses, setVirtualBuses] = useState<VirtualBusRecord[]>([]);
+  const [virtualBackend, setVirtualBackend] = useState<VirtualMidiBackendStatus>({
+    platform: '',
+    available: false,
+    message: 'Checking virtual MIDI support…'
+  });
   const [ndiStatus, setNdiStatus] = useState<NdiStatus>({ available: false });
   const [ndiSources, setNdiSources] = useState<NdiSource[]>([]);
   const [notice, setNotice] = useState('');
@@ -74,6 +91,19 @@ export default function App() {
     try {
       const snapshot = await invoke<MidiSnapshot>('list_midi_devices');
       setMidi(snapshot);
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }
+
+  async function refreshVirtualMidi() {
+    try {
+      const [buses, backend] = await Promise.all([
+        invoke<VirtualBusRecord[]>('list_virtual_midi_buses'),
+        invoke<VirtualMidiBackendStatus>('virtual_midi_backend_status')
+      ]);
+      setVirtualBuses(buses);
+      setVirtualBackend(backend);
     } catch (error) {
       setNotice(String(error));
     }
@@ -95,6 +125,7 @@ export default function App() {
 
   useEffect(() => {
     void refreshMidi();
+    void refreshVirtualMidi();
     void refreshNdi();
 
     const unlisten = listen<MidiEvent>('midi-event', ({ payload }) => {
@@ -132,9 +163,19 @@ export default function App() {
 
   async function createVirtualBus() {
     try {
-      const result = await invoke<string>('create_virtual_midi_bus', { name: virtualName });
-      setNotice(result);
-      await refreshMidi();
+      const result = await invoke<VirtualBusRecord>('create_virtual_midi_bus', { name: virtualName });
+      setNotice(`Created virtual MIDI bus: ${result.name}`);
+      await Promise.all([refreshMidi(), refreshVirtualMidi()]);
+    } catch (error) {
+      setNotice(String(error));
+    }
+  }
+
+  async function removeVirtualBus(id: string, name: string) {
+    try {
+      await invoke('remove_virtual_midi_bus', { id });
+      setNotice(`Removed virtual MIDI bus: ${name}`);
+      await Promise.all([refreshMidi(), refreshVirtualMidi()]);
     } catch (error) {
       setNotice(String(error));
     }
@@ -247,18 +288,61 @@ export default function App() {
               </Panel>
             </div>
 
-            <Panel title="VIRTUAL BUS" icon={<Network size={16}/>}>
-              <div className="inline-form">
+            <Panel title="VIRTUAL BUSES" icon={<Network size={16}/>}>
+              <div className="runtime-line">
+                <span className={`big-dot ${virtualBackend.available ? 'online' : ''}`} />
+                <div>
+                  <strong>
+                    {virtualBackend.platform || 'System'} virtual MIDI
+                    {virtualBackend.available ? ' ready' : ' unavailable'}
+                  </strong>
+                  <small>{virtualBackend.message}</small>
+                </div>
+              </div>
+
+              <div className="inline-form virtual-create">
                 <input
                   value={virtualName}
                   onChange={(event) => setVirtualName(event.target.value)}
+                  placeholder="Bus name"
                 />
-                <button className="primary" onClick={createVirtualBus}>
+                <button
+                  className="primary"
+                  onClick={createVirtualBus}
+                  disabled={!virtualBackend.available || !virtualName.trim()}
+                >
                   <Plus size={15}/> Create Bus
                 </button>
               </div>
+
+              <div className="virtual-bus-list">
+                {virtualBuses.length === 0 ? (
+                  <Empty text="No LumaLink virtual buses configured." />
+                ) : (
+                  virtualBuses.map((bus) => (
+                    <div className="device-row" key={bus.id}>
+                      <span className="status-dot online"/>
+                      <div>
+                        <strong>{bus.name}</strong>
+                        <small>
+                          {bus.backend === 'coremidi'
+                            ? 'COREMIDI · APPS ↔ LUMALINK'
+                            : 'WINDOWS MIDI SERVICES · BASIC LOOPBACK'}
+                        </small>
+                      </div>
+                      <button
+                        className="danger-small"
+                        onClick={() => removeVirtualBus(bus.id, bus.name)}
+                      >
+                        REMOVE
+                      </button>
+                    </div>
+                  ))
+                )}
+              </div>
+
               <p className="help">
-                macOS creates real CoreMIDI virtual input/output endpoints. Windows physical MIDI is active now; native Windows MIDI Services virtual devices are the next backend module.
+                Saved buses are restored when LumaLink launches. Closing the window leaves LumaLink running in the system tray so active endpoints stay alive.
               </p>
             </Panel>
           </>
@@ -426,8 +510,8 @@ export default function App() {
             <Panel title="BUILD PROFILE" icon={<Settings size={16}/>}>
               <div className="settings-list">
                 <div>
-                  <strong>Background routing service</strong>
-                  <small>Reserved as the next service split so UI closure will not own long-running routes.</small>
+                  <strong>Background system utility</strong>
+                  <small>Closing the window hides LumaLink to the tray instead of destroying virtual MIDI endpoints. Use Quit from the tray to stop the process.</small>
                 </div>
                 <div>
                   <strong>macOS test signing</strong>
