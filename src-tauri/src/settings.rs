@@ -11,11 +11,65 @@ pub(crate) struct VirtualBusRecord {
     pub association_id: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MidiRouteTransform {
+    #[serde(default)]
+    pub input_channel: Option<u8>,
+    #[serde(default)]
+    pub output_channel: Option<u8>,
+    #[serde(default)]
+    pub transpose: i8,
+    #[serde(default = "default_velocity_percent")]
+    pub velocity_percent: u8,
+    #[serde(default)]
+    pub cc_from: Option<u8>,
+    #[serde(default)]
+    pub cc_to: Option<u8>,
+    #[serde(default)]
+    pub block_timing: bool,
+    #[serde(default)]
+    pub block_sysex: bool,
+}
+
+fn default_velocity_percent() -> u8 {
+    100
+}
+
+impl Default for MidiRouteTransform {
+    fn default() -> Self {
+        Self {
+            input_channel: None,
+            output_channel: None,
+            transpose: 0,
+            velocity_percent: 100,
+            cc_from: None,
+            cc_to: None,
+            block_timing: false,
+            block_sysex: false,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MidiRouteRecord {
+    pub id: String,
+    pub name: String,
+    pub input_name: String,
+    pub output_name: String,
+    pub enabled: bool,
+    #[serde(default)]
+    pub transform: MidiRouteTransform,
+}
+
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct LumaLinkConfig {
     #[serde(default)]
     pub virtual_buses: Vec<VirtualBusRecord>,
+    #[serde(default)]
+    pub midi_routes: Vec<MidiRouteRecord>,
 }
 
 fn config_path(app: &AppHandle) -> Result<PathBuf, String> {
@@ -99,25 +153,86 @@ pub(crate) fn remove_virtual_bus(
     Ok(Some(record))
 }
 
+pub(crate) fn upsert_midi_route(
+    app: &AppHandle,
+    record: MidiRouteRecord,
+) -> Result<MidiRouteRecord, String> {
+    let mut config = load_config(app)?;
+
+    if let Some(existing) = config
+        .midi_routes
+        .iter_mut()
+        .find(|existing| existing.id == record.id)
+    {
+        *existing = record.clone();
+    } else {
+        config.midi_routes.push(record.clone());
+    }
+
+    save_config(app, &config)?;
+    Ok(record)
+}
+
+pub(crate) fn remove_midi_route(
+    app: &AppHandle,
+    id: &str,
+) -> Result<Option<MidiRouteRecord>, String> {
+    let mut config = load_config(app)?;
+
+    let Some(index) = config.midi_routes.iter().position(|record| record.id == id) else {
+        return Ok(None);
+    };
+
+    let record = config.midi_routes.remove(index);
+    save_config(app, &config)?;
+
+    Ok(Some(record))
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{LumaLinkConfig, VirtualBusRecord};
+    use super::{LumaLinkConfig, MidiRouteRecord, MidiRouteTransform, VirtualBusRecord};
 
     #[test]
-    fn config_json_round_trip_keeps_virtual_bus_identity() {
+    fn config_json_round_trip_keeps_system_state() {
         let config = LumaLinkConfig {
             virtual_buses: vec![VirtualBusRecord {
-                id: "abc".into(),
+                id: "bus-1".into(),
                 name: "Lighting".into(),
                 backend: "coremidi".into(),
                 association_id: None,
+            }],
+            midi_routes: vec![MidiRouteRecord {
+                id: "route-1".into(),
+                name: "Keys to Studio".into(),
+                input_name: "Keyboard".into(),
+                output_name: "LumaStudio".into(),
+                enabled: true,
+                transform: MidiRouteTransform {
+                    input_channel: Some(1),
+                    output_channel: Some(2),
+                    transpose: 12,
+                    velocity_percent: 90,
+                    cc_from: Some(1),
+                    cc_to: Some(11),
+                    block_timing: true,
+                    block_sysex: false,
+                },
             }],
         };
 
         let json = serde_json::to_string(&config).unwrap();
         let decoded: LumaLinkConfig = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(decoded.virtual_buses.len(), 1);
         assert_eq!(decoded.virtual_buses[0].name, "Lighting");
+        assert_eq!(decoded.midi_routes[0].transform.transpose, 12);
+        assert_eq!(decoded.midi_routes[0].transform.output_channel, Some(2));
+    }
+
+    #[test]
+    fn legacy_config_without_routes_still_loads() {
+        let json = r#"{"virtualBuses":[]}"#;
+        let decoded: LumaLinkConfig = serde_json::from_str(json).unwrap();
+        assert!(decoded.midi_routes.is_empty());
     }
 }
