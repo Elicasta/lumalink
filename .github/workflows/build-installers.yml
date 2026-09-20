@@ -1,0 +1,75 @@
+name: Build Installers
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: read
+
+jobs:
+  macos-dmg:
+    runs-on: macos-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm install
+
+      - run: npm run icons
+
+      - run: npm run tauri build -- --bundles dmg
+
+      - name: Verify macOS bundle signature
+        shell: bash
+        run: |
+          APP=$(find src-tauri/target/release/bundle -name 'LumaLink.app' -print -quit)
+          test -n "$APP"
+          codesign --verify --deep --strict --verbose=2 "$APP"
+          codesign -dv --verbose=4 "$APP" 2>&1 | head -30
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LumaLink-macOS-DMG
+          path: src-tauri/target/release/bundle/dmg/*.dmg
+          if-no-files-found: error
+
+  windows-exe:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - run: npm install
+
+      - run: npm run icons
+
+      - run: npm run tauri build -- --bundles nsis
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: LumaLink-Windows-EXE
+          path: src-tauri/target/release/bundle/nsis/*.exe
+          if-no-files-found: error
