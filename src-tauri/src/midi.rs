@@ -380,7 +380,7 @@ fn powershell(script: &str) -> Result<String, String> {
         .output()
         .map_err(|error| {
             format!(
-                "Windows MIDI Services PowerShell tools require PowerShell 7 and the WindowsMidiServices module: {error}"
+                "Windows MIDI Services compatibility mode requires PowerShell 7.6+ and the WindowsMidiServices module: {error}"
             )
         })?;
 
@@ -474,12 +474,12 @@ pub(crate) fn virtual_midi_backend_status() -> VirtualMidiBackendStatus {
             Ok(true) => VirtualMidiBackendStatus {
                 platform: "Windows".into(),
                 available: true,
-                message: "Windows MIDI Services basic loopbacks are available.".into(),
+                message: "Windows MIDI Services PowerShell compatibility loopbacks are available.".into(),
             },
             Ok(false) => VirtualMidiBackendStatus {
                 platform: "Windows".into(),
                 available: false,
-                message: "Windows MIDI Services basic loopbacks are not installed or enabled.".into(),
+                message: "Windows MIDI Services PowerShell compatibility tools are not installed or enabled.".into(),
             },
             Err(error) => VirtualMidiBackendStatus {
                 platform: "Windows".into(),
