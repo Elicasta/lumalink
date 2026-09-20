@@ -34,11 +34,26 @@ jobs:
 
       - run: npm run tauri build -- --bundles dmg
 
-      - name: Verify macOS bundle signature
+      - name: Verify macOS bundle signature inside DMG
         shell: bash
         run: |
-          APP=$(find src-tauri/target/release/bundle -name 'LumaLink.app' -print -quit)
-          test -n "$APP"
+          set -euo pipefail
+          DMG=$(find src-tauri/target/release/bundle/dmg -name '*.dmg' -print -quit)
+          test -n "$DMG"
+
+          MOUNT_POINT="$RUNNER_TEMP/lumalink-dmg"
+          mkdir -p "$MOUNT_POINT"
+
+          cleanup() {
+            hdiutil detach "$MOUNT_POINT" >/dev/null 2>&1 || true
+          }
+          trap cleanup EXIT
+
+          hdiutil attach "$DMG" -readonly -nobrowse -mountpoint "$MOUNT_POINT" >/dev/null
+
+          APP="$MOUNT_POINT/LumaLink.app"
+          test -d "$APP"
+
           codesign --verify --deep --strict --verbose=2 "$APP"
           codesign -dv --verbose=4 "$APP" 2>&1 | head -30
 
