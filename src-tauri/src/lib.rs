@@ -1,5 +1,6 @@
 mod midi;
 mod ndi;
+mod network;
 mod settings;
 
 use midi::{
@@ -22,6 +23,7 @@ use midi::{
     MidiRuntime,
 };
 use ndi::{discover_ndi_sources, ndi_runtime_status};
+use network::{network_discovery_status, start_discovery_responder};
 use std::sync::Mutex;
 use tauri::{
     menu::{Menu, MenuItem},
@@ -49,7 +51,8 @@ pub fn run() {
             create_virtual_midi_bus,
             remove_virtual_midi_bus,
             ndi_runtime_status,
-            discover_ndi_sources
+            discover_ndi_sources,
+            network_discovery_status
         ])
         .on_window_event(|window, event| {
             if let WindowEvent::CloseRequested { api, .. } = event {
@@ -93,6 +96,10 @@ pub fn run() {
                     _ => {}
                 })
                 .build(app)?;
+
+            if let Err(error) = start_discovery_responder() {
+                eprintln!("LumaLink LAN discovery unavailable: {error}");
+            }
 
             let midi_runtime = app.state::<Mutex<MidiRuntime>>();
 
