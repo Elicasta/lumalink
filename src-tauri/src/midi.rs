@@ -60,9 +60,9 @@ pub(crate) struct VirtualMidiBackendStatus {
 #[derive(Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct MidiRouteRuntimeStatus {
-    route: MidiRouteRecord,
-    active: bool,
-    error: Option<String>,
+    pub(crate) route: MidiRouteRecord,
+    pub(crate) active: bool,
+    pub(crate) error: Option<String>,
 }
 
 fn active_route_ids(runtime: &Mutex<MidiRuntime>) -> Result<Vec<String>, String> {
