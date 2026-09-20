@@ -1,6 +1,7 @@
 use crate::settings::{
-    load_config, remove_virtual_bus as remove_saved_virtual_bus, upsert_virtual_bus,
-    VirtualBusRecord,
+    load_config, remove_midi_route as remove_saved_midi_route,
+    remove_virtual_bus as remove_saved_virtual_bus, save_config, upsert_midi_route,
+    upsert_virtual_bus, MidiRouteRecord, MidiRouteTransform, VirtualBusRecord,
 };
 use midir::{Ignore, MidiInput, MidiInputConnection, MidiOutput};
 use serde::Serialize;
@@ -54,6 +55,237 @@ pub(crate) struct VirtualMidiBackendStatus {
     platform: String,
     available: bool,
     message: String,
+}
+
+#[derive(Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct MidiRouteRuntimeStatus {
+    route: MidiRouteRecord,
+    active: bool,
+    error: Option<String>,
+}
+
+fn active_route_ids(runtime: &Mutex<MidiRuntime>) -> Result<Vec<String>, String> {
+    Ok(runtime
+        .lock()
+        .map_err(|_| "MIDI runtime lock poisoned".to_string())?
+        .routes
+        .iter()
+        .map(|(id, _)| id.clone())
+        .collect())
+}
+
+fn stop_runtime_route(runtime: &Mutex<MidiRuntime>, id: &str) -> Result<(), String> {
+    runtime
+        .lock()
+        .map_err(|_| "MIDI runtime lock poisoned".to_string())?
+        .routes
+        .retain(|(route_id, _)| route_id != id);
+
+    Ok(())
+}
+
+fn validate_route(route: &MidiRouteRecord) -> Result<(), String> {
+    if route.name.trim().is_empty() {
+        return Err("Route name cannot be empty".into());
+    }
+
+    if route.input_name.trim().is_empty() || route.output_name.trim().is_empty() {
+        return Err("Route source and destination are required".into());
+    }
+
+    for channel in [route.transform.input_channel, route.transform.output_channel]
+        .into_iter()
+        .flatten()
+    {
+        if !(1..=16).contains(&channel) {
+            return Err("MIDI channels must be between 1 and 16".into());
+        }
+    }
+
+    if !(-48..=48).contains(&route.transform.transpose) {
+        return Err("Transpose must be between -48 and +48 semitones".into());
+    }
+
+    if !(1..=200).contains(&route.transform.velocity_percent) {
+        return Err("Velocity scaling must be between 1% and 200%".into());
+    }
+
+    for controller in [route.transform.cc_from, route.transform.cc_to]
+        .into_iter()
+        .flatten()
+    {
+        if controller > 127 {
+            return Err("MIDI CC numbers must be between 0 and 127".into());
+        }
+    }
+
+    if route.transform.cc_from.is_some() != route.transform.cc_to.is_some() {
+        return Err("CC remap requires both a source and destination controller number".into());
+    }
+
+    Ok(())
+}
+
+fn apply_transform(message: &[u8], transform: &MidiRouteTransform) -> Option<Vec<u8>> {
+    if message.is_empty() {
+        return None;
+    }
+
+    let status = message[0];
+
+    if transform.block_sysex && status == 0xF0 {
+        return None;
+    }
+
+    if transform.block_timing && matches!(status, 0xF8 | 0xFA | 0xFB | 0xFC) {
+        return None;
+    }
+
+    let mut output = message.to_vec();
+
+    if (0x80..=0xEF).contains(&status) {
+        let message_type = status & 0xF0;
+        let input_channel = (status & 0x0F) + 1;
+
+        if let Some(expected_channel) = transform.input_channel {
+            if input_channel != expected_channel {
+                return None;
+            }
+        }
+
+        if let Some(output_channel) = transform.output_channel {
+            output[0] = message_type | ((output_channel - 1) & 0x0F);
+        }
+
+        if matches!(message_type, 0x80 | 0x90) && output.len() >= 2 {
+            let transposed = output[1] as i16 + transform.transpose as i16;
+            output[1] = transposed.clamp(0, 127) as u8;
+        }
+
+        if matches!(message_type, 0x80 | 0x90) && output.len() >= 3 {
+            let scaled =
+                output[2] as u16 * transform.velocity_percent as u16 / 100u16;
+            output[2] = scaled.min(127) as u8;
+        }
+
+        if message_type == 0xB0 && output.len() >= 2 {
+            if let (Some(from), Some(to)) = (transform.cc_from, transform.cc_to) {
+                if output[1] == from {
+                    output[1] = to;
+                }
+            }
+        }
+    }
+
+    Some(output)
+}
+
+fn find_input_port_index(input: &MidiInput, name: &str) -> Option<usize> {
+    input
+        .ports()
+        .iter()
+        .enumerate()
+        .find_map(|(index, port)| {
+            input
+                .port_name(port)
+                .ok()
+                .filter(|port_name| port_name == name)
+                .map(|_| index)
+        })
+}
+
+fn find_output_port_index(output: &MidiOutput, name: &str) -> Option<usize> {
+    output
+        .ports()
+        .iter()
+        .enumerate()
+        .find_map(|(index, port)| {
+            output
+                .port_name(port)
+                .ok()
+                .filter(|port_name| port_name == name)
+                .map(|_| index)
+        })
+}
+
+fn start_route_record(
+    app: &AppHandle,
+    runtime: &Mutex<MidiRuntime>,
+    route: &MidiRouteRecord,
+) -> Result<(), String> {
+    validate_route(route)?;
+
+    if active_route_ids(runtime)?.iter().any(|id| id == &route.id) {
+        return Ok(());
+    }
+
+    let mut input = MidiInput::new("LumaLink route input").map_err(|error| error.to_string())?;
+    input.ignore(Ignore::None);
+    let output = MidiOutput::new("LumaLink route output").map_err(|error| error.to_string())?;
+
+    let input_index = find_input_port_index(&input, &route.input_name).ok_or_else(|| {
+        format!("MIDI input \"{}\" is not currently available", route.input_name)
+    })?;
+    let output_index = find_output_port_index(&output, &route.output_name).ok_or_else(|| {
+        format!("MIDI output \"{}\" is not currently available", route.output_name)
+    })?;
+
+    let input_ports = input.ports();
+    let output_ports = output.ports();
+
+    let input_port = input_ports
+        .get(input_index)
+        .ok_or_else(|| "MIDI source disappeared while connecting".to_string())?
+        .clone();
+    let output_port = output_ports
+        .get(output_index)
+        .ok_or_else(|| "MIDI destination disappeared while connecting".to_string())?
+        .clone();
+
+    let output_connection = output
+        .connect(&output_port, &format!("LumaLink · {}", route.name))
+        .map_err(|error| error.to_string())?;
+
+    let shared_output = Arc::new(Mutex::new(output_connection));
+    let output_for_callback = Arc::clone(&shared_output);
+    let app_for_event = app.clone();
+    let event_source = format!("{} · {}", route.name, route.input_name);
+    let transform = route.transform.clone();
+
+    let connection = input
+        .connect(
+            &input_port,
+            &format!("LumaLink · {}", route.name),
+            move |timestamp, message, _| {
+                let Some(transformed) = apply_transform(message, &transform) else {
+                    return;
+                };
+
+                if let Ok(mut output) = output_for_callback.lock() {
+                    let _ = output.send(&transformed);
+                }
+
+                let _ = app_for_event.emit(
+                    "midi-event",
+                    MidiEvent {
+                        timestamp,
+                        source: event_source.clone(),
+                        bytes: transformed,
+                    },
+                );
+            },
+            (),
+        )
+        .map_err(|error| error.to_string())?;
+
+    runtime
+        .lock()
+        .map_err(|_| "MIDI runtime lock poisoned".to_string())?
+        .routes
+        .push((route.id.clone(), connection));
+
+    Ok(())
 }
 
 #[tauri::command]
@@ -159,78 +391,131 @@ pub(crate) fn stop_midi_monitor(runtime: State<Mutex<MidiRuntime>>) -> Result<()
 }
 
 #[tauri::command]
-pub(crate) fn start_midi_route(
+pub(crate) fn list_saved_midi_routes(
     app: AppHandle,
     runtime: State<Mutex<MidiRuntime>>,
-    input_index: usize,
-    output_index: usize,
-) -> Result<String, String> {
-    let mut input = MidiInput::new("LumaLink route input").map_err(|error| error.to_string())?;
-    input.ignore(Ignore::None);
+) -> Result<Vec<MidiRouteRuntimeStatus>, String> {
+    let active = active_route_ids(&runtime)?;
 
-    let output = MidiOutput::new("LumaLink route output").map_err(|error| error.to_string())?;
+    Ok(load_config(&app)?
+        .midi_routes
+        .into_iter()
+        .map(|route| MidiRouteRuntimeStatus {
+            active: active.iter().any(|id| id == &route.id),
+            route,
+            error: None,
+        })
+        .collect())
+}
 
-    let input_ports = input.ports();
-    let output_ports = output.ports();
+#[tauri::command]
+pub(crate) fn save_midi_route(
+    app: AppHandle,
+    runtime: State<Mutex<MidiRuntime>>,
+    mut route: MidiRouteRecord,
+) -> Result<MidiRouteRuntimeStatus, String> {
+    if route.id.trim().is_empty() {
+        route.id = Uuid::new_v4().to_string();
+    }
 
-    let input_port = input_ports
-        .get(input_index)
-        .ok_or_else(|| "MIDI source disappeared".to_string())?
-        .clone();
+    route.name = route.name.trim().to_string();
+    validate_route(&route)?;
 
-    let output_port = output_ports
-        .get(output_index)
-        .ok_or_else(|| "MIDI destination disappeared".to_string())?
-        .clone();
+    stop_runtime_route(&runtime, &route.id)?;
+    let saved = upsert_midi_route(&app, route.clone())?;
 
-    let source_name = input
-        .port_name(&input_port)
-        .unwrap_or_else(|_| format!("Input {}", input_index + 1));
+    let error = if saved.enabled {
+        start_route_record(&app, &runtime, &saved).err()
+    } else {
+        None
+    };
 
-    let destination_name = output
-        .port_name(&output_port)
-        .unwrap_or_else(|_| format!("Output {}", output_index + 1));
+    Ok(MidiRouteRuntimeStatus {
+        active: error.is_none() && saved.enabled,
+        route: saved,
+        error,
+    })
+}
 
-    let output_connection = output
-        .connect(&output_port, "LumaLink route")
-        .map_err(|error| error.to_string())?;
+#[tauri::command]
+pub(crate) fn set_midi_route_enabled(
+    app: AppHandle,
+    runtime: State<Mutex<MidiRuntime>>,
+    id: String,
+    enabled: bool,
+) -> Result<MidiRouteRuntimeStatus, String> {
+    let mut config = load_config(&app)?;
+    let route = config
+        .midi_routes
+        .iter_mut()
+        .find(|route| route.id == id)
+        .ok_or_else(|| "Saved MIDI route not found".to_string())?;
 
-    let shared_output = Arc::new(Mutex::new(output_connection));
-    let output_for_callback = Arc::clone(&shared_output);
-    let app_for_event = app.clone();
-    let event_source = source_name.clone();
+    route.enabled = enabled;
+    let route = route.clone();
+    save_config(&app, &config)?;
 
-    let connection = input
-        .connect(
-            &input_port,
-            "LumaLink route",
-            move |timestamp, message, _| {
-                if let Ok(mut output) = output_for_callback.lock() {
-                    let _ = output.send(message);
-                }
+    stop_runtime_route(&runtime, &route.id)?;
 
-                let _ = app_for_event.emit(
-                    "midi-event",
-                    MidiEvent {
-                        timestamp,
-                        source: event_source.clone(),
-                        bytes: message.to_vec(),
-                    },
-                );
-            },
-            (),
-        )
-        .map_err(|error| error.to_string())?;
+    let error = if enabled {
+        start_route_record(&app, &runtime, &route).err()
+    } else {
+        None
+    };
 
-    let route_id = Uuid::new_v4().to_string();
+    Ok(MidiRouteRuntimeStatus {
+        active: enabled && error.is_none(),
+        route,
+        error,
+    })
+}
 
-    runtime
-        .lock()
-        .map_err(|_| "MIDI runtime lock poisoned".to_string())?
-        .routes
-        .push((route_id.clone(), connection));
+#[tauri::command]
+pub(crate) fn delete_midi_route(
+    app: AppHandle,
+    runtime: State<Mutex<MidiRuntime>>,
+    id: String,
+) -> Result<(), String> {
+    stop_runtime_route(&runtime, &id)?;
+    remove_saved_midi_route(&app, &id)?;
+    Ok(())
+}
 
-    Ok(format!("{route_id}:{source_name} -> {destination_name}"))
+#[tauri::command]
+pub(crate) fn reconnect_enabled_midi_routes(
+    app: AppHandle,
+    runtime: State<Mutex<MidiRuntime>>,
+) -> Result<Vec<MidiRouteRuntimeStatus>, String> {
+    let routes = load_config(&app)?.midi_routes;
+
+    {
+        let mut guard = runtime
+            .lock()
+            .map_err(|_| "MIDI runtime lock poisoned".to_string())?;
+        guard.routes.clear();
+    }
+
+    let mut statuses = Vec::new();
+
+    for route in routes {
+        if !route.enabled {
+            statuses.push(MidiRouteRuntimeStatus {
+                route,
+                active: false,
+                error: None,
+            });
+            continue;
+        }
+
+        let error = start_route_record(&app, &runtime, &route).err();
+        statuses.push(MidiRouteRuntimeStatus {
+            active: error.is_none(),
+            route,
+            error,
+        });
+    }
+
+    Ok(statuses)
 }
 
 #[tauri::command]
@@ -583,19 +868,105 @@ pub(crate) fn restore_virtual_midi_buses(
     }
 
     if changed {
-        crate::settings::save_config(app, &config)?;
+        save_config(app, &config)?;
     }
 
     Ok(restored)
 }
 
+pub(crate) fn restore_saved_midi_routes(
+    app: &AppHandle,
+    runtime: &Mutex<MidiRuntime>,
+) -> Result<Vec<MidiRouteRuntimeStatus>, String> {
+    let routes = load_config(app)?.midi_routes;
+    let mut statuses = Vec::new();
+
+    for route in routes {
+        if !route.enabled {
+            statuses.push(MidiRouteRuntimeStatus {
+                route,
+                active: false,
+                error: None,
+            });
+            continue;
+        }
+
+        let error = start_route_record(app, runtime, &route).err();
+        statuses.push(MidiRouteRuntimeStatus {
+            active: error.is_none(),
+            route,
+            error,
+        });
+    }
+
+    Ok(statuses)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::apply_transform;
+    use crate::settings::MidiRouteTransform;
+
+    fn transform() -> MidiRouteTransform {
+        MidiRouteTransform::default()
+    }
+
     #[test]
     fn midi_status_channel_math_is_stable() {
         for channel in 0..16u8 {
             assert_eq!((0xB0 | channel) & 0x0F, channel);
         }
+    }
+
+    #[test]
+    fn route_transform_filters_input_channel() {
+        let mut t = transform();
+        t.input_channel = Some(2);
+
+        assert!(apply_transform(&[0x90, 60, 100], &t).is_none());
+        assert_eq!(apply_transform(&[0x91, 60, 100], &t), Some(vec![0x91, 60, 100]));
+    }
+
+    #[test]
+    fn route_transform_remaps_channel_transpose_velocity_and_cc() {
+        let mut t = transform();
+        t.output_channel = Some(4);
+        t.transpose = 12;
+        t.velocity_percent = 50;
+
+        assert_eq!(
+            apply_transform(&[0x90, 60, 100], &t),
+            Some(vec![0x93, 72, 50])
+        );
+
+        t.cc_from = Some(1);
+        t.cc_to = Some(11);
+        assert_eq!(
+            apply_transform(&[0xB0, 1, 127], &t),
+            Some(vec![0xB3, 11, 127])
+        );
+    }
+
+    #[test]
+    fn route_transform_blocks_timing_and_sysex_when_requested() {
+        let mut t = transform();
+        t.block_timing = true;
+        t.block_sysex = true;
+
+        assert!(apply_transform(&[0xF8], &t).is_none());
+        assert!(apply_transform(&[0xFA], &t).is_none());
+        assert!(apply_transform(&[0xF0, 0x7D, 0x01, 0xF7], &t).is_none());
+    }
+
+    #[test]
+    fn route_transform_clamps_note_range() {
+        let mut t = transform();
+        t.transpose = 48;
+
+        assert_eq!(
+            apply_transform(&[0x90, 100, 100], &t),
+            Some(vec![0x90, 127, 100])
+        );
     }
 
     #[cfg(target_os = "windows")]
